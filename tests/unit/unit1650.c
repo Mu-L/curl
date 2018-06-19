@@ -57,7 +57,7 @@ struct dohrequest {
 };
 
 
-struct dohrequest req[] = {
+static struct dohrequest req[] = {
   {"test.host.name", DNS_TYPE_A, DNS_Q1, sizeof(DNS_Q1)-1, 0 },
   {"test.host.name", DNS_TYPE_AAAA, DNS_Q2, sizeof(DNS_Q2)-1, 0 },
   {"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
@@ -82,9 +82,9 @@ struct dohresp {
   "\x01\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x37\x00\x04\x7f\x00\x00" \
   "\x01"
 
-const char full49[] = DNS_FOO_EXAMPLE_COM;
+static const char full49[] = DNS_FOO_EXAMPLE_COM;
 
-struct dohresp resp[] = {
+static struct dohresp resp[] = {
   {"\x00\x00", 2, DNS_TYPE_A, DOH_TOO_SMALL_BUFFER, NULL },
   {"\x00\x01\x00\x01\x00\x01\x00\x01\x00\x01\x00\x01", 12,
    DNS_TYPE_A, DOH_DNS_BAD_ID, NULL },
