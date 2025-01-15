@@ -30,8 +30,6 @@ CURLcode curl_ws_recv(CURL *curl, void *buffer, size_t buflen,
 
 # DESCRIPTION
 
-This function call is EXPERIMENTAL.
-
 Retrieves as much as possible of a received WebSocket data fragment into the
 **buffer**, but not more than **buflen** bytes. *recv* is set to the
 number of bytes actually stored.
@@ -44,7 +42,7 @@ If the function call is successful, the *meta* pointer gets set to point to a
 *const struct curl_ws_frame* that contains information about the received
 data. That struct must not be freed and its contents must not be relied upon
 anymore once another WebSocket function is called. See the curl_ws_meta(3) for
-details on that struct.a
+details on that struct.
 
 # %PROTOCOLS%
 
@@ -69,9 +67,14 @@ int main(void)
 
 # RETURN VALUE
 
-Returns **CURLE_OK** if everything is okay, and a non-zero number for
-errors. Returns **CURLE_GOT_NOTHING** if the associated connection is
-closed.
+This function returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3). If CURLOPT_ERRORBUFFER(3) was set with curl_easy_setopt(3)
+there can be an error message stored in the error buffer when non-zero is
+returned.
+
+Returns **CURLE_GOT_NOTHING** if the associated connection is closed.
 
 Instead of blocking, the function returns **CURLE_AGAIN**. The correct
 behavior is then to wait for the socket to signal readability before calling

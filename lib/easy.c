@@ -48,6 +48,7 @@
 #include <curl/curl.h>
 #include "transfer.h"
 #include "vtls/vtls.h"
+#include "vtls/vtls_scache.h"
 #include "url.h"
 #include "getinfo.h"
 #include "hostip.h"
@@ -750,6 +751,11 @@ static CURLcode easy_perform(struct Curl_easy *data, bool events)
   if(!data)
     return CURLE_BAD_FUNCTION_ARGUMENT;
 
+  if(data->conn) {
+    failf(data, "cannot use again while associated with a connection");
+    return CURLE_BAD_FUNCTION_ARGUMENT;
+  }
+
   if(data->set.errorbuffer)
     /* clear this as early as possible */
     data->set.errorbuffer[0] = 0;
@@ -764,9 +770,9 @@ static CURLcode easy_perform(struct Curl_easy *data, bool events)
   if(data->multi_easy)
     multi = data->multi_easy;
   else {
-    /* this multi handle will only ever have a single easy handled attached
-       to it, so make it use minimal hashes */
-    multi = Curl_multi_handle(1, 3, 7);
+    /* this multi handle will only ever have a single easy handle attached to
+       it, so make it use minimal hash sizes */
+    multi = Curl_multi_handle(1, 3, 7, 3);
     if(!multi)
       return CURLE_OUT_OF_MEMORY;
   }
@@ -940,6 +946,7 @@ CURL *curl_easy_duphandle(CURL *d)
     goto fail;
 
   Curl_dyn_init(&outcurl->state.headerb, CURL_MAX_HTTP_HEADER);
+  Curl_netrc_init(&outcurl->state.netrc);
 
   /* the connection pool is setup on demand */
   outcurl->state.lastconnect_id = -1;
@@ -1334,4 +1341,42 @@ CURLcode curl_easy_upkeep(CURL *d)
 
   /* Use the common function to keep connections alive. */
   return Curl_cpool_upkeep(data);
+}
+
+CURLcode curl_easy_ssls_import(CURL *d, const char *session_key,
+                               const unsigned char *shmac, size_t shmac_len,
+                               const unsigned char *sdata, size_t sdata_len)
+{
+#ifdef USE_SSLS_EXPORT
+  struct Curl_easy *data = d;
+  if(!GOOD_EASY_HANDLE(data))
+    return CURLE_BAD_FUNCTION_ARGUMENT;
+  return Curl_ssl_session_import(data, session_key,
+                                 shmac, shmac_len, sdata, sdata_len);
+#else
+  (void)d;
+  (void)session_key;
+  (void)shmac;
+  (void)shmac_len;
+  (void)sdata;
+  (void)sdata_len;
+  return CURLE_NOT_BUILT_IN;
+#endif
+}
+
+CURLcode curl_easy_ssls_export(CURL *d,
+                               curl_ssls_export_cb *export_fn,
+                               void *userptr)
+{
+#ifdef USE_SSLS_EXPORT
+  struct Curl_easy *data = d;
+  if(!GOOD_EASY_HANDLE(data))
+    return CURLE_BAD_FUNCTION_ARGUMENT;
+  return Curl_ssl_session_export(data, export_fn, userptr);
+#else
+  (void)d;
+  (void)export_fn;
+  (void)userptr;
+  return CURLE_NOT_BUILT_IN;
+#endif
 }

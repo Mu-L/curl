@@ -433,6 +433,8 @@ static int h2_client_new(struct Curl_cfilter *cf,
 {
   struct cf_h2_ctx *ctx = cf->ctx;
   nghttp2_option *o;
+  nghttp2_mem mem = {NULL, Curl_nghttp2_malloc, Curl_nghttp2_free,
+                     Curl_nghttp2_calloc, Curl_nghttp2_realloc};
 
   int rc = nghttp2_option_new(&o);
   if(rc)
@@ -445,7 +447,7 @@ static int h2_client_new(struct Curl_cfilter *cf,
      HTTP field value. */
   nghttp2_option_set_no_rfc9113_leading_and_trailing_ws_validation(o, 1);
 #endif
-  rc = nghttp2_session_client_new2(&ctx->h2, cbs, cf, o);
+  rc = nghttp2_session_client_new3(&ctx->h2, cbs, cf, o, &mem);
   nghttp2_option_del(o);
   return rc;
 }
@@ -2335,7 +2337,7 @@ static ssize_t cf_h2_send(struct Curl_cfilter *cf, struct Curl_easy *data,
   if(should_close_session(ctx)) {
     /* nghttp2 thinks this session is done. If the stream has not been
      * closed, this is an error state for out transfer */
-    if(stream->closed) {
+    if(stream && stream->closed) {
       nwritten = http2_handle_stream_close(cf, data, stream, err);
     }
     else {
@@ -2494,9 +2496,7 @@ static CURLcode cf_h2_connect(struct Curl_cfilter *cf,
   /* Send out our SETTINGS and ACKs and such. If that blocks, we
    * have it buffered and  can count this filter as being connected */
   result = h2_progress_egress(cf, data);
-  if(result == CURLE_AGAIN)
-    result = CURLE_OK;
-  else if(result)
+  if(result && (result != CURLE_AGAIN))
     goto out;
 
   *done = TRUE;
@@ -2810,8 +2810,8 @@ out:
   return result;
 }
 
-static bool Curl_cf_is_http2(struct Curl_cfilter *cf,
-                             const struct Curl_easy *data)
+static bool cf_is_http2(struct Curl_cfilter *cf,
+                        const struct Curl_easy *data)
 {
   (void)data;
   for(; cf; cf = cf->next) {
@@ -2827,7 +2827,7 @@ bool Curl_conn_is_http2(const struct Curl_easy *data,
                         const struct connectdata *conn,
                         int sockindex)
 {
-  return conn ? Curl_cf_is_http2(conn->cfilter[sockindex], data) : FALSE;
+  return conn ? cf_is_http2(conn->cfilter[sockindex], data) : FALSE;
 }
 
 bool Curl_http2_may_switch(struct Curl_easy *data,
@@ -2879,7 +2879,7 @@ CURLcode Curl_http2_switch_at(struct Curl_cfilter *cf, struct Curl_easy *data)
   struct Curl_cfilter *cf_h2;
   CURLcode result;
 
-  DEBUGASSERT(!Curl_cf_is_http2(cf, data));
+  DEBUGASSERT(!cf_is_http2(cf, data));
 
   result = http2_cfilter_insert_after(cf, data, FALSE);
   if(result)
@@ -2955,9 +2955,33 @@ bool Curl_h2_http_1_1_error(struct Curl_easy *data)
 {
   if(Curl_conn_is_http2(data, data->conn, FIRSTSOCKET)) {
     int err = Curl_conn_get_stream_error(data, data->conn, FIRSTSOCKET);
-    return (err == NGHTTP2_HTTP_1_1_REQUIRED);
+    return err == NGHTTP2_HTTP_1_1_REQUIRED;
   }
   return FALSE;
+}
+
+void *Curl_nghttp2_malloc(size_t size, void *user_data)
+{
+  (void)user_data;
+  return Curl_cmalloc(size);
+}
+
+void Curl_nghttp2_free(void *ptr, void *user_data)
+{
+  (void)user_data;
+  Curl_cfree(ptr);
+}
+
+void *Curl_nghttp2_calloc(size_t nmemb, size_t size, void *user_data)
+{
+  (void)user_data;
+  return Curl_ccalloc(nmemb, size);
+}
+
+void *Curl_nghttp2_realloc(void *ptr, size_t size, void *user_data)
+{
+  (void)user_data;
+  return Curl_crealloc(ptr, size);
 }
 
 #else /* !USE_NGHTTP2 */

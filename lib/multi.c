@@ -46,6 +46,7 @@
 #include "multihandle.h"
 #include "sigpipe.h"
 #include "vtls/vtls.h"
+#include "vtls/vtls_scache.h"
 #include "http_proxy.h"
 #include "http2.h"
 #include "socketpair.h"
@@ -59,7 +60,7 @@
 /*
   CURL_SOCKET_HASH_TABLE_SIZE should be a prime number. Increasing it from 97
   to 911 takes on a 32-bit machine 4 x 804 = 3211 more bytes. Still, every
-  CURL handle takes 45-50 K memory, therefore this 3K are not significant.
+  curl handle takes 6K memory, therefore this 3K are not significant.
 */
 #ifndef CURL_SOCKET_HASH_TABLE_SIZE
 #define CURL_SOCKET_HASH_TABLE_SIZE 911
@@ -73,6 +74,10 @@
 #define CURL_DNS_HASH_SIZE 71
 #endif
 
+#ifndef CURL_TLS_SESSION_SIZE
+#define CURL_TLS_SESSION_SIZE 25
+#endif
+
 #define CURL_MULTI_HANDLE 0x000bab1e
 
 #ifdef DEBUGBUILD
@@ -80,7 +85,7 @@
  * are not NULL, but no longer have the MAGIC touch. This gives
  * us early warning on things only discovered by valgrind otherwise. */
 #define GOOD_MULTI_HANDLE(x) \
-  (((x) && (x)->magic == CURL_MULTI_HANDLE)? TRUE: \
+  (((x) && (x)->magic == CURL_MULTI_HANDLE)? TRUE:      \
   (DEBUGASSERT(!(x)), FALSE))
 #else
 #define GOOD_MULTI_HANDLE(x) \
@@ -99,8 +104,8 @@ static CURLMcode multi_timeout(struct Curl_multi *multi,
                                long *timeout_ms);
 static void process_pending_handles(struct Curl_multi *multi);
 static void multi_xfer_bufs_free(struct Curl_multi *multi);
-static void Curl_expire_ex(struct Curl_easy *data, const struct curltime *nowp,
-                           timediff_t milli, expire_id id);
+static void expire_ex(struct Curl_easy *data, const struct curltime *nowp,
+                      timediff_t milli, expire_id id);
 
 #if defined( DEBUGBUILD) && !defined(CURL_DISABLE_VERBOSE_STRINGS)
 static const char * const multi_statename[]={
@@ -395,9 +400,10 @@ static void multi_addmsg(struct Curl_multi *multi, struct Curl_message *msg)
   Curl_llist_append(&multi->msglist, msg, &msg->list);
 }
 
-struct Curl_multi *Curl_multi_handle(size_t hashsize, /* socket hash */
+struct Curl_multi *Curl_multi_handle(size_t hashsize,  /* socket hash */
                                      size_t chashsize, /* connection hash */
-                                     size_t dnssize) /* dns hash */
+                                     size_t dnssize,   /* dns hash */
+                                     size_t sesssize)  /* TLS session cache */
 {
   struct Curl_multi *multi = calloc(1, sizeof(struct Curl_multi));
 
@@ -414,7 +420,10 @@ struct Curl_multi *Curl_multi_handle(size_t hashsize, /* socket hash */
                  Curl_hash_str, Curl_str_key_compare, ph_freeentry);
 
   if(Curl_cpool_init(&multi->cpool, Curl_on_disconnect,
-                         multi, NULL, chashsize))
+                     multi, NULL, chashsize))
+    goto error;
+
+  if(Curl_ssl_scache_create(sesssize, 2, &multi->ssl_scache))
     goto error;
 
   Curl_llist_init(&multi->msglist, NULL);
@@ -447,6 +456,7 @@ error:
   Curl_hash_destroy(&multi->proto_hash);
   Curl_hash_destroy(&multi->hostcache);
   Curl_cpool_destroy(&multi->cpool);
+  Curl_ssl_scache_destroy(multi->ssl_scache);
   free(multi);
   return NULL;
 }
@@ -455,7 +465,8 @@ CURLM *curl_multi_init(void)
 {
   return Curl_multi_handle(CURL_SOCKET_HASH_TABLE_SIZE,
                            CURL_CONNECTION_HASH_SIZE,
-                           CURL_DNS_HASH_SIZE);
+                           CURL_DNS_HASH_SIZE,
+                           CURL_TLS_SESSION_SIZE);
 }
 
 #if defined(DEBUGBUILD) && !defined(CURL_DISABLE_VERBOSE_STRINGS)
@@ -787,7 +798,7 @@ CURLMcode curl_multi_remove_handle(CURLM *m, CURL *d)
     return CURLM_BAD_HANDLE;
 
   /* Verify that we got a somewhat good easy handle too */
-  if(!GOOD_EASY_HANDLE(data) || !multi->num_easy)
+  if(!GOOD_EASY_HANDLE(data))
     return CURLM_BAD_EASY_HANDLE;
 
   /* Prevent users from trying to remove same easy handle more than once */
@@ -798,10 +809,15 @@ CURLMcode curl_multi_remove_handle(CURLM *m, CURL *d)
   if(data->multi != multi)
     return CURLM_BAD_EASY_HANDLE;
 
+  if(!multi->num_easy) {
+    DEBUGASSERT(0);
+    return CURLM_INTERNAL_ERROR;
+  }
+
   if(multi->in_callback)
     return CURLM_RECURSIVE_API_CALL;
 
-  premature = (data->mstate < MSTATE_COMPLETED) ? TRUE : FALSE;
+  premature = (data->mstate < MSTATE_COMPLETED);
 
   /* If the 'state' is not INIT or COMPLETED, we might need to do something
      nice to put the easy_handle in a good known state when this returns. */
@@ -917,7 +933,7 @@ CURLMcode curl_multi_remove_handle(CURLM *m, CURL *d)
 /* Return TRUE if the application asked for multiplexing */
 bool Curl_multiplex_wanted(const struct Curl_multi *multi)
 {
-  return (multi && (multi->multiplexing));
+  return multi && multi->multiplexing;
 }
 
 /*
@@ -1170,10 +1186,17 @@ CURLMcode curl_multi_fdset(CURLM *m,
       if(!FDSET_SOCK(data->last_poll.sockets[i]))
         /* pretend it does not exist */
         continue;
+#if defined(__DJGPP__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warith-conversion"
+#endif
       if(data->last_poll.actions[i] & CURL_POLL_IN)
         FD_SET(data->last_poll.sockets[i], read_fd_set);
       if(data->last_poll.actions[i] & CURL_POLL_OUT)
         FD_SET(data->last_poll.sockets[i], write_fd_set);
+#if defined(__DJGPP__)
+#pragma GCC diagnostic pop
+#endif
       if((int)data->last_poll.sockets[i] > this_max_fd)
         this_max_fd = (int)data->last_poll.sockets[i];
     }
@@ -1193,8 +1216,9 @@ CURLMcode curl_multi_waitfds(CURLM *m,
   CURLMcode result = CURLM_OK;
   struct Curl_llist_node *e;
   struct Curl_multi *multi = m;
+  unsigned int need = 0;
 
-  if(!ufds)
+  if(!ufds && (size || !fd_count))
     return CURLM_BAD_FUNCTION_ARGUMENT;
 
   if(!GOOD_MULTI_HANDLE(multi))
@@ -1207,20 +1231,17 @@ CURLMcode curl_multi_waitfds(CURLM *m,
   for(e = Curl_llist_head(&multi->process); e; e = Curl_node_next(e)) {
     struct Curl_easy *data = Curl_node_elem(e);
     multi_getsock(data, &data->last_poll);
-    if(Curl_waitfds_add_ps(&cwfds, &data->last_poll)) {
-      result = CURLM_OUT_OF_MEMORY;
-      goto out;
-    }
+    need += Curl_waitfds_add_ps(&cwfds, &data->last_poll);
   }
 
-  if(Curl_cpool_add_waitfds(&multi->cpool, &cwfds)) {
+  need += Curl_cpool_add_waitfds(&multi->cpool, &cwfds);
+
+  if(need != cwfds.n && ufds) {
     result = CURLM_OUT_OF_MEMORY;
-    goto out;
   }
 
-out:
   if(fd_count)
-    *fd_count = cwfds.n;
+    *fd_count = need;
   return result;
 }
 
@@ -1541,6 +1562,9 @@ CURLMcode curl_multi_wakeup(CURLM *m)
   if(multi->wakeup_pair[1] != CURL_SOCKET_BAD) {
 #ifdef USE_EVENTFD
     buf = &val;
+    /* eventfd has a stringent rule of requiring the 8-byte buffer when
+       calling write(2) on it, which makes the sizeof(buf) below fine since
+       this is only used on 64-bit systems and then the pointer is 64-bit */
 #else
     buf[0] = 1;
 #endif
@@ -2116,19 +2140,489 @@ static CURLcode multi_follow(struct Curl_easy *data,
 #endif /* CURL_DISABLE_HTTP */
 }
 
+static CURLMcode state_performing(struct Curl_easy *data,
+                                  struct curltime *nowp,
+                                  bool *stream_errorp,
+                                  CURLcode *resultp)
+{
+  char *newurl = NULL;
+  bool retry = FALSE;
+  timediff_t recv_timeout_ms = 0;
+  timediff_t send_timeout_ms = 0;
+  CURLMcode rc = CURLM_OK;
+  CURLcode result = *resultp = CURLE_OK;
+  *stream_errorp = FALSE;
+
+  /* check if over send speed */
+  if(data->set.max_send_speed)
+    send_timeout_ms = Curl_pgrsLimitWaitTime(&data->progress.ul,
+                                             data->set.max_send_speed,
+                                             *nowp);
+
+  /* check if over recv speed */
+  if(data->set.max_recv_speed)
+    recv_timeout_ms = Curl_pgrsLimitWaitTime(&data->progress.dl,
+                                             data->set.max_recv_speed,
+                                             *nowp);
+
+  if(send_timeout_ms || recv_timeout_ms) {
+    Curl_ratelimit(data, *nowp);
+    multistate(data, MSTATE_RATELIMITING);
+    if(send_timeout_ms >= recv_timeout_ms)
+      Curl_expire(data, send_timeout_ms, EXPIRE_TOOFAST);
+    else
+      Curl_expire(data, recv_timeout_ms, EXPIRE_TOOFAST);
+    return CURLM_OK;
+  }
+
+  /* read/write data if it is ready to do so */
+  result = Curl_sendrecv(data, nowp);
+
+  if(data->req.done || (result == CURLE_RECV_ERROR)) {
+    /* If CURLE_RECV_ERROR happens early enough, we assume it was a race
+     * condition and the server closed the reused connection exactly when we
+     * wanted to use it, so figure out if that is indeed the case.
+     */
+    CURLcode ret = Curl_retry_request(data, &newurl);
+    if(!ret)
+      retry = !!newurl;
+    else if(!result)
+      result = ret;
+
+    if(retry) {
+      /* if we are to retry, set the result to OK and consider the
+         request as done */
+      result = CURLE_OK;
+      data->req.done = TRUE;
+    }
+  }
+  else if((CURLE_HTTP2_STREAM == result) &&
+          Curl_h2_http_1_1_error(data)) {
+    CURLcode ret = Curl_retry_request(data, &newurl);
+
+    if(!ret) {
+      infof(data, "Downgrades to HTTP/1.1");
+      streamclose(data->conn, "Disconnect HTTP/2 for HTTP/1");
+      data->state.httpwant = CURL_HTTP_VERSION_1_1;
+      /* clear the error message bit too as we ignore the one we got */
+      data->state.errorbuf = FALSE;
+      if(!newurl)
+        /* typically for HTTP_1_1_REQUIRED error on first flight */
+        newurl = strdup(data->state.url);
+      /* if we are to retry, set the result to OK and consider the request
+         as done */
+      retry = TRUE;
+      result = CURLE_OK;
+      data->req.done = TRUE;
+    }
+    else
+      result = ret;
+  }
+
+  if(result) {
+    /*
+     * The transfer phase returned error, we mark the connection to get closed
+     * to prevent being reused. This is because we cannot possibly know if the
+     * connection is in a good shape or not now. Unless it is a protocol which
+     * uses two "channels" like FTP, as then the error happened in the data
+     * connection.
+     */
+
+    if(!(data->conn->handler->flags & PROTOPT_DUAL) &&
+       result != CURLE_HTTP2_STREAM)
+      streamclose(data->conn, "Transfer returned error");
+
+    multi_posttransfer(data);
+    multi_done(data, result, TRUE);
+  }
+  else if(data->req.done && !Curl_cwriter_is_paused(data)) {
+
+    /* call this even if the readwrite function returned error */
+    multi_posttransfer(data);
+
+    /* When we follow redirects or is set to retry the connection, we must to
+       go back to the CONNECT state */
+    if(data->req.newurl || retry) {
+      followtype follow = FOLLOW_NONE;
+      if(!retry) {
+        /* if the URL is a follow-location and not just a retried request then
+           figure out the URL here */
+        free(newurl);
+        newurl = data->req.newurl;
+        data->req.newurl = NULL;
+        follow = FOLLOW_REDIR;
+      }
+      else
+        follow = FOLLOW_RETRY;
+      (void)multi_done(data, CURLE_OK, FALSE);
+      /* multi_done() might return CURLE_GOT_NOTHING */
+      result = multi_follow(data, newurl, follow);
+      if(!result) {
+        multistate(data, MSTATE_SETUP);
+        rc = CURLM_CALL_MULTI_PERFORM;
+      }
+    }
+    else {
+      /* after the transfer is done, go DONE */
+
+      /* but first check to see if we got a location info even though we are
+         not following redirects */
+      if(data->req.location) {
+        free(newurl);
+        newurl = data->req.location;
+        data->req.location = NULL;
+        result = multi_follow(data, newurl, FOLLOW_FAKE);
+        if(result) {
+          *stream_errorp = TRUE;
+          result = multi_done(data, result, TRUE);
+        }
+      }
+
+      if(!result) {
+        multistate(data, MSTATE_DONE);
+        rc = CURLM_CALL_MULTI_PERFORM;
+      }
+    }
+  }
+  else if(data->state.select_bits && !Curl_xfer_is_blocked(data)) {
+    /* This avoids CURLM_CALL_MULTI_PERFORM so that a very fast transfer does
+       not get stuck on this transfer at the expense of other concurrent
+       transfers */
+    Curl_expire(data, 0, EXPIRE_RUN_NOW);
+  }
+  free(newurl);
+  *resultp = result;
+  return rc;
+}
+
+static CURLMcode state_do(struct Curl_easy *data,
+                          bool *stream_errorp,
+                          CURLcode *resultp)
+{
+  CURLMcode rc = CURLM_OK;
+  CURLcode result = CURLE_OK;
+  if(data->set.fprereq) {
+    int prereq_rc;
+
+    /* call the prerequest callback function */
+    Curl_set_in_callback(data, TRUE);
+    prereq_rc = data->set.fprereq(data->set.prereq_userp,
+                                  data->info.primary.remote_ip,
+                                  data->info.primary.local_ip,
+                                  data->info.primary.remote_port,
+                                  data->info.primary.local_port);
+    Curl_set_in_callback(data, FALSE);
+    if(prereq_rc != CURL_PREREQFUNC_OK) {
+      failf(data, "operation aborted by pre-request callback");
+      /* failure in pre-request callback - do not do any other processing */
+      result = CURLE_ABORTED_BY_CALLBACK;
+      multi_posttransfer(data);
+      multi_done(data, result, FALSE);
+      *stream_errorp = TRUE;
+      goto end;
+    }
+  }
+
+  if(data->set.connect_only == 1) {
+    /* keep connection open for application to use the socket */
+    connkeep(data->conn, "CONNECT_ONLY");
+    multistate(data, MSTATE_DONE);
+    rc = CURLM_CALL_MULTI_PERFORM;
+  }
+  else {
+    bool dophase_done = FALSE;
+    /* Perform the protocol's DO action */
+    result = multi_do(data, &dophase_done);
+
+    /* When multi_do() returns failure, data->conn might be NULL! */
+
+    if(!result) {
+      if(!dophase_done) {
+#ifndef CURL_DISABLE_FTP
+        /* some steps needed for wildcard matching */
+        if(data->state.wildcardmatch) {
+          struct WildcardData *wc = data->wildcard;
+          if(wc->state == CURLWC_DONE || wc->state == CURLWC_SKIP) {
+            /* skip some states if it is important */
+            multi_done(data, CURLE_OK, FALSE);
+
+            /* if there is no connection left, skip the DONE state */
+            multistate(data, data->conn ?
+                       MSTATE_DONE : MSTATE_COMPLETED);
+            rc = CURLM_CALL_MULTI_PERFORM;
+            goto end;
+          }
+        }
+#endif
+        /* DO was not completed in one function call, we must continue
+           DOING... */
+        multistate(data, MSTATE_DOING);
+        rc = CURLM_CALL_MULTI_PERFORM;
+      }
+
+      /* after DO, go DO_DONE... or DO_MORE */
+      else if(data->conn->bits.do_more) {
+        /* we are supposed to do more, but we need to sit down, relax and wait
+           a little while first */
+        multistate(data, MSTATE_DOING_MORE);
+        rc = CURLM_CALL_MULTI_PERFORM;
+      }
+      else {
+        /* we are done with the DO, now DID */
+        multistate(data, MSTATE_DID);
+        rc = CURLM_CALL_MULTI_PERFORM;
+      }
+    }
+    else if((CURLE_SEND_ERROR == result) &&
+            data->conn->bits.reuse) {
+      /*
+       * In this situation, a connection that we were trying to use may have
+       * unexpectedly died. If possible, send the connection back to the
+       * CONNECT phase so we can try again.
+       */
+      char *newurl = NULL;
+      followtype follow = FOLLOW_NONE;
+      CURLcode drc;
+
+      drc = Curl_retry_request(data, &newurl);
+      if(drc) {
+        /* a failure here pretty much implies an out of memory */
+        result = drc;
+        *stream_errorp = TRUE;
+      }
+
+      multi_posttransfer(data);
+      drc = multi_done(data, result, FALSE);
+
+      /* When set to retry the connection, we must go back to the CONNECT
+       * state */
+      if(newurl) {
+        if(!drc || (drc == CURLE_SEND_ERROR)) {
+          follow = FOLLOW_RETRY;
+          drc = multi_follow(data, newurl, follow);
+          if(!drc) {
+            multistate(data, MSTATE_SETUP);
+            rc = CURLM_CALL_MULTI_PERFORM;
+            result = CURLE_OK;
+          }
+          else {
+            /* Follow failed */
+            result = drc;
+          }
+        }
+        else {
+          /* done did not return OK or SEND_ERROR */
+          result = drc;
+        }
+      }
+      else {
+        /* Have error handler disconnect conn if we cannot retry */
+        *stream_errorp = TRUE;
+      }
+      free(newurl);
+    }
+    else {
+      /* failure detected */
+      multi_posttransfer(data);
+      if(data->conn)
+        multi_done(data, result, FALSE);
+      *stream_errorp = TRUE;
+    }
+  }
+end:
+  *resultp = result;
+  return rc;
+}
+
+static CURLMcode state_ratelimiting(struct Curl_easy *data,
+                                    struct curltime *nowp,
+                                    CURLcode *resultp)
+{
+  CURLcode result = CURLE_OK;
+  CURLMcode rc = CURLM_OK;
+  DEBUGASSERT(data->conn);
+  /* if both rates are within spec, resume transfer */
+  if(Curl_pgrsUpdate(data))
+    result = CURLE_ABORTED_BY_CALLBACK;
+  else
+    result = Curl_speedcheck(data, *nowp);
+
+  if(result) {
+    if(!(data->conn->handler->flags & PROTOPT_DUAL) &&
+       result != CURLE_HTTP2_STREAM)
+      streamclose(data->conn, "Transfer returned error");
+
+    multi_posttransfer(data);
+    multi_done(data, result, TRUE);
+  }
+  else {
+    timediff_t recv_timeout_ms = 0;
+    timediff_t send_timeout_ms = 0;
+    if(data->set.max_send_speed)
+      send_timeout_ms =
+        Curl_pgrsLimitWaitTime(&data->progress.ul,
+                               data->set.max_send_speed,
+                               *nowp);
+
+    if(data->set.max_recv_speed)
+      recv_timeout_ms =
+        Curl_pgrsLimitWaitTime(&data->progress.dl,
+                               data->set.max_recv_speed,
+                               *nowp);
+
+    if(!send_timeout_ms && !recv_timeout_ms) {
+      multistate(data, MSTATE_PERFORMING);
+      Curl_ratelimit(data, *nowp);
+      /* start performing again right away */
+      rc = CURLM_CALL_MULTI_PERFORM;
+    }
+    else if(send_timeout_ms >= recv_timeout_ms)
+      Curl_expire(data, send_timeout_ms, EXPIRE_TOOFAST);
+    else
+      Curl_expire(data, recv_timeout_ms, EXPIRE_TOOFAST);
+  }
+  *resultp = result;
+  return rc;
+}
+
+static CURLMcode state_resolving(struct Curl_multi *multi,
+                                 struct Curl_easy *data,
+                                 bool *stream_errorp,
+                                 CURLcode *resultp)
+{
+  struct Curl_dns_entry *dns = NULL;
+  struct connectdata *conn = data->conn;
+  const char *hostname;
+  CURLcode result = CURLE_OK;
+  CURLMcode rc = CURLM_OK;
+
+  DEBUGASSERT(conn);
+#ifndef CURL_DISABLE_PROXY
+  if(conn->bits.httpproxy)
+    hostname = conn->http_proxy.host.name;
+  else
+#endif
+    if(conn->bits.conn_to_host)
+      hostname = conn->conn_to_host.name;
+    else
+      hostname = conn->host.name;
+
+  /* check if we have the name resolved by now */
+  dns = Curl_fetch_addr(data, hostname, conn->primary.remote_port);
+
+  if(dns) {
+#ifdef CURLRES_ASYNCH
+    data->state.async.dns = dns;
+    data->state.async.done = TRUE;
+#endif
+    result = CURLE_OK;
+    infof(data, "Hostname '%s' was found in DNS cache", hostname);
+  }
+
+  if(!dns)
+    result = Curl_resolv_check(data, &dns);
+
+  /* Update sockets here, because the socket(s) may have been closed and the
+     application thus needs to be told, even if it is likely that the same
+     socket(s) will again be used further down. If the name has not yet been
+     resolved, it is likely that new sockets have been opened in an attempt to
+     contact another resolver. */
+  rc = singlesocket(multi, data);
+  if(rc)
+    return rc;
+
+  if(dns) {
+    bool connected;
+    /* Perform the next step in the connection phase, and then move on to the
+       WAITCONNECT state */
+    result = Curl_once_resolved(data, &connected);
+
+    if(result)
+      /* if Curl_once_resolved() returns failure, the connection struct is
+         already freed and gone */
+      data->conn = NULL; /* no more connection */
+    else {
+      /* call again please so that we get the next socket setup */
+      rc = CURLM_CALL_MULTI_PERFORM;
+      if(connected)
+        multistate(data, MSTATE_PROTOCONNECT);
+      else {
+        multistate(data, MSTATE_CONNECTING);
+      }
+    }
+  }
+
+  if(result)
+    /* failure detected */
+    *stream_errorp = TRUE;
+
+  *resultp = result;
+  return rc;
+}
+
+static CURLMcode state_connect(struct Curl_multi *multi,
+                               struct Curl_easy *data,
+                               struct curltime *nowp,
+                               CURLcode *resultp)
+{
+  /* Connect. We want to get a connection identifier filled in. This state can
+     be entered from SETUP and from PENDING. */
+  bool connected;
+  bool async;
+  CURLMcode rc = CURLM_OK;
+  CURLcode result = Curl_connect(data, &async, &connected);
+  if(CURLE_NO_CONNECTION_AVAILABLE == result) {
+    /* There was no connection available. We will go to the pending state and
+       wait for an available connection. */
+    multistate(data, MSTATE_PENDING);
+    /* unlink from process list */
+    Curl_node_remove(&data->multi_queue);
+    /* add handle to pending list */
+    Curl_llist_append(&multi->pending, data, &data->multi_queue);
+    *resultp = CURLE_OK;
+    return rc;
+  }
+  else
+    process_pending_handles(data->multi);
+
+  if(!result) {
+    *nowp = Curl_pgrsTime(data, TIMER_POSTQUEUE);
+    if(async)
+      /* We are now waiting for an asynchronous name lookup */
+      multistate(data, MSTATE_RESOLVING);
+    else {
+      /* after the connect has been sent off, go WAITCONNECT unless the
+         protocol connect is already done and we can go directly to WAITDO or
+         DO! */
+      rc = CURLM_CALL_MULTI_PERFORM;
+
+      if(connected) {
+        if(!data->conn->bits.reuse &&
+           Curl_conn_is_multiplex(data->conn, FIRSTSOCKET)) {
+          /* new connection, can multiplex, wake pending handles */
+          process_pending_handles(data->multi);
+        }
+        multistate(data, MSTATE_PROTOCONNECT);
+      }
+      else {
+        multistate(data, MSTATE_CONNECTING);
+      }
+    }
+  }
+  *resultp = result;
+  return rc;
+}
+
 static CURLMcode multi_runsingle(struct Curl_multi *multi,
                                  struct curltime *nowp,
                                  struct Curl_easy *data)
 {
   struct Curl_message *msg = NULL;
   bool connected;
-  bool async;
   bool protocol_connected = FALSE;
   bool dophase_done = FALSE;
   CURLMcode rc;
   CURLcode result = CURLE_OK;
-  timediff_t recv_timeout_ms;
-  timediff_t send_timeout_ms;
   int control;
 
   if(!GOOD_EASY_HANDLE(data))
@@ -2173,8 +2667,8 @@ static CURLMcode multi_runsingle(struct Curl_multi *multi,
 
     switch(data->mstate) {
     case MSTATE_INIT:
-      /* Transitional state. init this transfer. A handle never comes
-         back to this state. */
+      /* Transitional state. init this transfer. A handle never comes back to
+         this state. */
       result = Curl_pretransfer(data);
       if(result)
         break;
@@ -2200,119 +2694,13 @@ static CURLMcode multi_runsingle(struct Curl_multi *multi,
       FALLTHROUGH();
 
     case MSTATE_CONNECT:
-      /* Connect. We want to get a connection identifier filled in. This state
-         can be entered from SETUP and from PENDING. */
-      result = Curl_connect(data, &async, &connected);
-      if(CURLE_NO_CONNECTION_AVAILABLE == result) {
-        /* There was no connection available. We will go to the pending
-           state and wait for an available connection. */
-        multistate(data, MSTATE_PENDING);
-        /* unlink from process list */
-        Curl_node_remove(&data->multi_queue);
-        /* add handle to pending list */
-        Curl_llist_append(&multi->pending, data, &data->multi_queue);
-        result = CURLE_OK;
-        break;
-      }
-      else
-        process_pending_handles(data->multi);
-
-      if(!result) {
-        *nowp = Curl_pgrsTime(data, TIMER_POSTQUEUE);
-        if(async)
-          /* We are now waiting for an asynchronous name lookup */
-          multistate(data, MSTATE_RESOLVING);
-        else {
-          /* after the connect has been sent off, go WAITCONNECT unless the
-             protocol connect is already done and we can go directly to
-             WAITDO or DO! */
-          rc = CURLM_CALL_MULTI_PERFORM;
-
-          if(connected) {
-            if(!data->conn->bits.reuse &&
-               Curl_conn_is_multiplex(data->conn, FIRSTSOCKET)) {
-              /* new connection, can multiplex, wake pending handles */
-              process_pending_handles(data->multi);
-            }
-            multistate(data, MSTATE_PROTOCONNECT);
-          }
-          else {
-            multistate(data, MSTATE_CONNECTING);
-          }
-        }
-      }
+      rc = state_connect(multi, data, nowp, &result);
       break;
 
     case MSTATE_RESOLVING:
       /* awaiting an asynch name resolve to complete */
-    {
-      struct Curl_dns_entry *dns = NULL;
-      struct connectdata *conn = data->conn;
-      const char *hostname;
-
-      DEBUGASSERT(conn);
-#ifndef CURL_DISABLE_PROXY
-      if(conn->bits.httpproxy)
-        hostname = conn->http_proxy.host.name;
-      else
-#endif
-        if(conn->bits.conn_to_host)
-          hostname = conn->conn_to_host.name;
-      else
-        hostname = conn->host.name;
-
-      /* check if we have the name resolved by now */
-      dns = Curl_fetch_addr(data, hostname, conn->primary.remote_port);
-
-      if(dns) {
-#ifdef CURLRES_ASYNCH
-        data->state.async.dns = dns;
-        data->state.async.done = TRUE;
-#endif
-        result = CURLE_OK;
-        infof(data, "Hostname '%s' was found in DNS cache", hostname);
-      }
-
-      if(!dns)
-        result = Curl_resolv_check(data, &dns);
-
-      /* Update sockets here, because the socket(s) may have been
-         closed and the application thus needs to be told, even if it
-         is likely that the same socket(s) will again be used further
-         down. If the name has not yet been resolved, it is likely
-         that new sockets have been opened in an attempt to contact
-         another resolver. */
-      rc = singlesocket(multi, data);
-      if(rc)
-        return rc;
-
-      if(dns) {
-        /* Perform the next step in the connection phase, and then move on
-           to the WAITCONNECT state */
-        result = Curl_once_resolved(data, &connected);
-
-        if(result)
-          /* if Curl_once_resolved() returns failure, the connection struct
-             is already freed and gone */
-          data->conn = NULL; /* no more connection */
-        else {
-          /* call again please so that we get the next socket setup */
-          rc = CURLM_CALL_MULTI_PERFORM;
-          if(connected)
-            multistate(data, MSTATE_PROTOCONNECT);
-          else {
-            multistate(data, MSTATE_CONNECTING);
-          }
-        }
-      }
-
-      if(result) {
-        /* failure detected */
-        stream_error = TRUE;
-        break;
-      }
-    }
-    break;
+      rc = state_resolving(multi, data, &stream_error, &result);
+      break;
 
 #ifndef CURL_DISABLE_HTTP
     case MSTATE_TUNNELING:
@@ -2353,9 +2741,10 @@ static CURLMcode multi_runsingle(struct Curl_multi *multi,
 
     case MSTATE_PROTOCONNECT:
       if(!result && data->conn->bits.reuse) {
-        /* ftp seems to hang when protoconnect on reused connection
-         * since we handle PROTOCONNECT in general inside the filers, it
-         * seems wrong to restart this on a reused connection. */
+        /* ftp seems to hang when protoconnect on reused connection since we
+         * handle PROTOCONNECT in general inside the filers, it seems wrong to
+         * restart this on a reused connection.
+         */
         multistate(data, MSTATE_DO);
         rc = CURLM_CALL_MULTI_PERFORM;
         break;
@@ -2397,135 +2786,7 @@ static CURLMcode multi_runsingle(struct Curl_multi *multi,
       break;
 
     case MSTATE_DO:
-      if(data->set.fprereq) {
-        int prereq_rc;
-
-        /* call the prerequest callback function */
-        Curl_set_in_callback(data, TRUE);
-        prereq_rc = data->set.fprereq(data->set.prereq_userp,
-                                      data->info.primary.remote_ip,
-                                      data->info.primary.local_ip,
-                                      data->info.primary.remote_port,
-                                      data->info.primary.local_port);
-        Curl_set_in_callback(data, FALSE);
-        if(prereq_rc != CURL_PREREQFUNC_OK) {
-          failf(data, "operation aborted by pre-request callback");
-          /* failure in pre-request callback - do not do any other
-             processing */
-          result = CURLE_ABORTED_BY_CALLBACK;
-          multi_posttransfer(data);
-          multi_done(data, result, FALSE);
-          stream_error = TRUE;
-          break;
-        }
-      }
-
-      if(data->set.connect_only == 1) {
-        /* keep connection open for application to use the socket */
-        connkeep(data->conn, "CONNECT_ONLY");
-        multistate(data, MSTATE_DONE);
-        result = CURLE_OK;
-        rc = CURLM_CALL_MULTI_PERFORM;
-      }
-      else {
-        /* Perform the protocol's DO action */
-        result = multi_do(data, &dophase_done);
-
-        /* When multi_do() returns failure, data->conn might be NULL! */
-
-        if(!result) {
-          if(!dophase_done) {
-#ifndef CURL_DISABLE_FTP
-            /* some steps needed for wildcard matching */
-            if(data->state.wildcardmatch) {
-              struct WildcardData *wc = data->wildcard;
-              if(wc->state == CURLWC_DONE || wc->state == CURLWC_SKIP) {
-                /* skip some states if it is important */
-                multi_done(data, CURLE_OK, FALSE);
-
-                /* if there is no connection left, skip the DONE state */
-                multistate(data, data->conn ?
-                           MSTATE_DONE : MSTATE_COMPLETED);
-                rc = CURLM_CALL_MULTI_PERFORM;
-                break;
-              }
-            }
-#endif
-            /* DO was not completed in one function call, we must continue
-               DOING... */
-            multistate(data, MSTATE_DOING);
-            rc = CURLM_CALL_MULTI_PERFORM;
-          }
-
-          /* after DO, go DO_DONE... or DO_MORE */
-          else if(data->conn->bits.do_more) {
-            /* we are supposed to do more, but we need to sit down, relax
-               and wait a little while first */
-            multistate(data, MSTATE_DOING_MORE);
-            rc = CURLM_CALL_MULTI_PERFORM;
-          }
-          else {
-            /* we are done with the DO, now DID */
-            multistate(data, MSTATE_DID);
-            rc = CURLM_CALL_MULTI_PERFORM;
-          }
-        }
-        else if((CURLE_SEND_ERROR == result) &&
-                data->conn->bits.reuse) {
-          /*
-           * In this situation, a connection that we were trying to use
-           * may have unexpectedly died. If possible, send the connection
-           * back to the CONNECT phase so we can try again.
-           */
-          char *newurl = NULL;
-          followtype follow = FOLLOW_NONE;
-          CURLcode drc;
-
-          drc = Curl_retry_request(data, &newurl);
-          if(drc) {
-            /* a failure here pretty much implies an out of memory */
-            result = drc;
-            stream_error = TRUE;
-          }
-
-          multi_posttransfer(data);
-          drc = multi_done(data, result, FALSE);
-
-          /* When set to retry the connection, we must go back to the CONNECT
-           * state */
-          if(newurl) {
-            if(!drc || (drc == CURLE_SEND_ERROR)) {
-              follow = FOLLOW_RETRY;
-              drc = multi_follow(data, newurl, follow);
-              if(!drc) {
-                multistate(data, MSTATE_SETUP);
-                rc = CURLM_CALL_MULTI_PERFORM;
-                result = CURLE_OK;
-              }
-              else {
-                /* Follow failed */
-                result = drc;
-              }
-            }
-            else {
-              /* done did not return OK or SEND_ERROR */
-              result = drc;
-            }
-          }
-          else {
-            /* Have error handler disconnect conn if we cannot retry */
-            stream_error = TRUE;
-          }
-          free(newurl);
-        }
-        else {
-          /* failure detected */
-          multi_posttransfer(data);
-          if(data->conn)
-            multi_done(data, result, FALSE);
-          stream_error = TRUE;
-        }
-      }
+      rc = state_do(data, &stream_error, &result);
       break;
 
     case MSTATE_DOING:
@@ -2598,195 +2859,12 @@ static CURLMcode multi_runsingle(struct Curl_multi *multi,
       break;
 
     case MSTATE_RATELIMITING: /* limit-rate exceeded in either direction */
-      DEBUGASSERT(data->conn);
-      /* if both rates are within spec, resume transfer */
-      if(Curl_pgrsUpdate(data))
-        result = CURLE_ABORTED_BY_CALLBACK;
-      else
-        result = Curl_speedcheck(data, *nowp);
-
-      if(result) {
-        if(!(data->conn->handler->flags & PROTOPT_DUAL) &&
-           result != CURLE_HTTP2_STREAM)
-          streamclose(data->conn, "Transfer returned error");
-
-        multi_posttransfer(data);
-        multi_done(data, result, TRUE);
-      }
-      else {
-        send_timeout_ms = 0;
-        if(data->set.max_send_speed)
-          send_timeout_ms =
-            Curl_pgrsLimitWaitTime(&data->progress.ul,
-                                   data->set.max_send_speed,
-                                   *nowp);
-
-        recv_timeout_ms = 0;
-        if(data->set.max_recv_speed)
-          recv_timeout_ms =
-            Curl_pgrsLimitWaitTime(&data->progress.dl,
-                                   data->set.max_recv_speed,
-                                   *nowp);
-
-        if(!send_timeout_ms && !recv_timeout_ms) {
-          multistate(data, MSTATE_PERFORMING);
-          Curl_ratelimit(data, *nowp);
-          /* start performing again right away */
-          rc = CURLM_CALL_MULTI_PERFORM;
-        }
-        else if(send_timeout_ms >= recv_timeout_ms)
-          Curl_expire(data, send_timeout_ms, EXPIRE_TOOFAST);
-        else
-          Curl_expire(data, recv_timeout_ms, EXPIRE_TOOFAST);
-      }
+      rc = state_ratelimiting(data, nowp, &result);
       break;
 
     case MSTATE_PERFORMING:
-    {
-      char *newurl = NULL;
-      bool retry = FALSE;
-      /* check if over send speed */
-      send_timeout_ms = 0;
-      if(data->set.max_send_speed)
-        send_timeout_ms = Curl_pgrsLimitWaitTime(&data->progress.ul,
-                                                 data->set.max_send_speed,
-                                                 *nowp);
-
-      /* check if over recv speed */
-      recv_timeout_ms = 0;
-      if(data->set.max_recv_speed)
-        recv_timeout_ms = Curl_pgrsLimitWaitTime(&data->progress.dl,
-                                                 data->set.max_recv_speed,
-                                                 *nowp);
-
-      if(send_timeout_ms || recv_timeout_ms) {
-        Curl_ratelimit(data, *nowp);
-        multistate(data, MSTATE_RATELIMITING);
-        if(send_timeout_ms >= recv_timeout_ms)
-          Curl_expire(data, send_timeout_ms, EXPIRE_TOOFAST);
-        else
-          Curl_expire(data, recv_timeout_ms, EXPIRE_TOOFAST);
-        break;
-      }
-
-      /* read/write data if it is ready to do so */
-      result = Curl_sendrecv(data, nowp);
-
-      if(data->req.done || (result == CURLE_RECV_ERROR)) {
-        /* If CURLE_RECV_ERROR happens early enough, we assume it was a race
-         * condition and the server closed the reused connection exactly when
-         * we wanted to use it, so figure out if that is indeed the case.
-         */
-        CURLcode ret = Curl_retry_request(data, &newurl);
-        if(!ret)
-          retry = (newurl) ? TRUE : FALSE;
-        else if(!result)
-          result = ret;
-
-        if(retry) {
-          /* if we are to retry, set the result to OK and consider the
-             request as done */
-          result = CURLE_OK;
-          data->req.done = TRUE;
-        }
-      }
-      else if((CURLE_HTTP2_STREAM == result) &&
-              Curl_h2_http_1_1_error(data)) {
-        CURLcode ret = Curl_retry_request(data, &newurl);
-
-        if(!ret) {
-          infof(data, "Downgrades to HTTP/1.1");
-          streamclose(data->conn, "Disconnect HTTP/2 for HTTP/1");
-          data->state.httpwant = CURL_HTTP_VERSION_1_1;
-          /* clear the error message bit too as we ignore the one we got */
-          data->state.errorbuf = FALSE;
-          if(!newurl)
-            /* typically for HTTP_1_1_REQUIRED error on first flight */
-            newurl = strdup(data->state.url);
-          /* if we are to retry, set the result to OK and consider the request
-             as done */
-          retry = TRUE;
-          result = CURLE_OK;
-          data->req.done = TRUE;
-        }
-        else
-          result = ret;
-      }
-
-      if(result) {
-        /*
-         * The transfer phase returned error, we mark the connection to get
-         * closed to prevent being reused. This is because we cannot possibly
-         * know if the connection is in a good shape or not now. Unless it is
-         * a protocol which uses two "channels" like FTP, as then the error
-         * happened in the data connection.
-         */
-
-        if(!(data->conn->handler->flags & PROTOPT_DUAL) &&
-           result != CURLE_HTTP2_STREAM)
-          streamclose(data->conn, "Transfer returned error");
-
-        multi_posttransfer(data);
-        multi_done(data, result, TRUE);
-      }
-      else if(data->req.done && !Curl_cwriter_is_paused(data)) {
-
-        /* call this even if the readwrite function returned error */
-        multi_posttransfer(data);
-
-        /* When we follow redirects or is set to retry the connection, we must
-           to go back to the CONNECT state */
-        if(data->req.newurl || retry) {
-          followtype follow = FOLLOW_NONE;
-          if(!retry) {
-            /* if the URL is a follow-location and not just a retried request
-               then figure out the URL here */
-            free(newurl);
-            newurl = data->req.newurl;
-            data->req.newurl = NULL;
-            follow = FOLLOW_REDIR;
-          }
-          else
-            follow = FOLLOW_RETRY;
-          (void)multi_done(data, CURLE_OK, FALSE);
-          /* multi_done() might return CURLE_GOT_NOTHING */
-          result = multi_follow(data, newurl, follow);
-          if(!result) {
-            multistate(data, MSTATE_SETUP);
-            rc = CURLM_CALL_MULTI_PERFORM;
-          }
-        }
-        else {
-          /* after the transfer is done, go DONE */
-
-          /* but first check to see if we got a location info even though we
-             are not following redirects */
-          if(data->req.location) {
-            free(newurl);
-            newurl = data->req.location;
-            data->req.location = NULL;
-            result = multi_follow(data, newurl, FOLLOW_FAKE);
-            if(result) {
-              stream_error = TRUE;
-              result = multi_done(data, result, TRUE);
-            }
-          }
-
-          if(!result) {
-            multistate(data, MSTATE_DONE);
-            rc = CURLM_CALL_MULTI_PERFORM;
-          }
-        }
-      }
-      else if(data->state.select_bits && !Curl_xfer_is_blocked(data)) {
-        /* This avoids CURLM_CALL_MULTI_PERFORM so that a very fast transfer
-           will not get stuck on this transfer at the expense of other
-           concurrent transfers */
-        Curl_expire(data, 0, EXPIRE_RUN_NOW);
-      }
-      free(newurl);
+      rc = state_performing(data, nowp, &stream_error, &result);
       break;
-    }
 
     case MSTATE_DONE:
       /* this state is highly transient, so run another loop after this */
@@ -2964,8 +3042,10 @@ CURLMcode curl_multi_perform(CURLM *m, int *running_handles)
 
   sigpipe_apply(multi->cpool.idata, &pipe_st);
   Curl_cpool_multi_perform(multi);
-
   sigpipe_restore(&pipe_st);
+
+  if(multi_ischanged(m, TRUE))
+    process_pending_handles(m);
 
   /*
    * Simply remove all expired timers from the splay since handles are dealt
@@ -3067,6 +3147,7 @@ CURLMcode curl_multi_cleanup(CURLM *m)
     Curl_hash_destroy(&multi->proto_hash);
     Curl_hash_destroy(&multi->hostcache);
     Curl_psl_destroy(&multi->psl);
+    Curl_ssl_scache_destroy(multi->ssl_scache);
 
 #ifdef USE_WINSOCK
     WSACloseEvent(multi->wsa_event);
@@ -3527,10 +3608,18 @@ static CURLMcode multi_socket(struct Curl_multi *multi,
         else {
           /* Expire with out current now, so we will get it below when
            * asking the splaytree for expired transfers. */
-          Curl_expire_ex(data, &mrc.now, 0, EXPIRE_RUN_NOW);
+          expire_ex(data, &mrc.now, 0, EXPIRE_RUN_NOW);
         }
       }
     }
+  }
+  else {
+    /* Asked to run due to time-out. Clear the 'last_expire_ts' variable to
+       force Curl_update_timer() to trigger a callback to the app again even
+       if the same timeout is still the one to run after this call. That
+       handles the case when the application asks libcurl to run the timeout
+       prematurely. */
+    memset(&multi->last_expire_ts, 0, sizeof(multi->last_expire_ts));
   }
 
   result = multi_run_expired(&mrc);
@@ -3553,6 +3642,9 @@ out:
     Curl_cpool_multi_perform(multi);
   }
   sigpipe_restore(&mrc.pipe_st);
+
+  if(multi_ischanged(multi, TRUE))
+    process_pending_handles(multi);
 
   if(running_handles)
     *running_handles = (int)multi->num_alive;
@@ -3611,9 +3703,6 @@ CURLMcode curl_multi_setopt(CURLM *m,
     break;
   case CURLMOPT_MAX_TOTAL_CONNECTIONS:
     multi->max_total_connections = va_arg(param, long);
-    /* for now, let this also decide the max number of connections
-     * in shutdown handling */
-    multi->max_shutdown_connections = va_arg(param, long);
     break;
     /* options formerly used for pipelining */
   case CURLMOPT_MAX_PIPELINE_LENGTH:
@@ -3867,20 +3956,9 @@ multi_addtimeout(struct Curl_easy *data,
   return CURLM_OK;
 }
 
-/*
- * Curl_expire()
- *
- * given a number of milliseconds from now to use to set the 'act before
- * this'-time for the transfer, to be extracted by curl_multi_timeout()
- *
- * The timeout will be added to a queue of timeouts if it defines a moment in
- * time that is later than the current head of queue.
- *
- * Expire replaces a former timeout using the same id if already set.
- */
-static void Curl_expire_ex(struct Curl_easy *data,
-                           const struct curltime *nowp,
-                           timediff_t milli, expire_id id)
+static void expire_ex(struct Curl_easy *data,
+                      const struct curltime *nowp,
+                      timediff_t milli, expire_id id)
 {
   struct Curl_multi *multi = data->multi;
   struct curltime *curr_expire = &data->state.expiretime;
@@ -3938,10 +4016,21 @@ static void Curl_expire_ex(struct Curl_easy *data,
                                      &data->state.timenode);
 }
 
+/*
+ * Curl_expire()
+ *
+ * given a number of milliseconds from now to use to set the 'act before
+ * this'-time for the transfer, to be extracted by curl_multi_timeout()
+ *
+ * The timeout will be added to a queue of timeouts if it defines a moment in
+ * time that is later than the current head of queue.
+ *
+ * Expire replaces a former timeout using the same id if already set.
+ */
 void Curl_expire(struct Curl_easy *data, timediff_t milli, expire_id id)
 {
   struct curltime now = Curl_now();
-  Curl_expire_ex(data, &now, milli, id);
+  expire_ex(data, &now, milli, id);
 }
 
 /*
@@ -4061,7 +4150,7 @@ void Curl_set_in_callback(struct Curl_easy *data, bool value)
 
 bool Curl_is_in_callback(struct Curl_easy *data)
 {
-  return (data && data->multi && data->multi->in_callback);
+  return data && data->multi && data->multi->in_callback;
 }
 
 unsigned int Curl_multi_max_concurrent_streams(struct Curl_multi *multi)
@@ -4194,6 +4283,51 @@ void Curl_multi_xfer_ulbuf_release(struct Curl_easy *data, char *buf)
   data->multi->xfer_ulbuf_borrowed = FALSE;
 }
 
+CURLcode Curl_multi_xfer_sockbuf_borrow(struct Curl_easy *data,
+                                        size_t blen, char **pbuf)
+{
+  DEBUGASSERT(data);
+  DEBUGASSERT(data->multi);
+  *pbuf = NULL;
+  if(!data->multi) {
+    failf(data, "transfer has no multi handle");
+    return CURLE_FAILED_INIT;
+  }
+  if(data->multi->xfer_sockbuf_borrowed) {
+    failf(data, "attempt to borrow xfer_sockbuf when already borrowed");
+    return CURLE_AGAIN;
+  }
+
+  if(data->multi->xfer_sockbuf && blen > data->multi->xfer_sockbuf_len) {
+    /* not large enough, get a new one */
+    free(data->multi->xfer_sockbuf);
+    data->multi->xfer_sockbuf = NULL;
+    data->multi->xfer_sockbuf_len = 0;
+  }
+
+  if(!data->multi->xfer_sockbuf) {
+    data->multi->xfer_sockbuf = malloc(blen);
+    if(!data->multi->xfer_sockbuf) {
+      failf(data, "could not allocate xfer_sockbuf of %zu bytes", blen);
+      return CURLE_OUT_OF_MEMORY;
+    }
+    data->multi->xfer_sockbuf_len = blen;
+  }
+
+  data->multi->xfer_sockbuf_borrowed = TRUE;
+  *pbuf = data->multi->xfer_sockbuf;
+  return CURLE_OK;
+}
+
+void Curl_multi_xfer_sockbuf_release(struct Curl_easy *data, char *buf)
+{
+  (void)buf;
+  DEBUGASSERT(data);
+  DEBUGASSERT(data->multi);
+  DEBUGASSERT(!buf || data->multi->xfer_sockbuf == buf);
+  data->multi->xfer_sockbuf_borrowed = FALSE;
+}
+
 static void multi_xfer_bufs_free(struct Curl_multi *multi)
 {
   DEBUGASSERT(multi);
@@ -4203,6 +4337,9 @@ static void multi_xfer_bufs_free(struct Curl_multi *multi)
   Curl_safefree(multi->xfer_ulbuf);
   multi->xfer_ulbuf_len = 0;
   multi->xfer_ulbuf_borrowed = FALSE;
+  Curl_safefree(multi->xfer_sockbuf);
+  multi->xfer_sockbuf_len = 0;
+  multi->xfer_sockbuf_borrowed = FALSE;
 }
 
 struct Curl_easy *Curl_multi_get_handle(struct Curl_multi *multi,

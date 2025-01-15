@@ -641,12 +641,10 @@ static void storerequest(char *reqbuf, size_t totalsize)
 
 storerequest_cleanup:
 
-  do {
-    res = fclose(dump);
-  } while(res && ((error = errno) == EINTR));
+  res = fclose(dump);
   if(res)
     logmsg("Error closing file %s error: %d %s",
-           dumpfile, error, strerror(error));
+           dumpfile, errno, strerror(errno));
 }
 
 /* return 0 on success, non-zero on failure */
@@ -976,12 +974,10 @@ static int send_doc(curl_socket_t sock, struct httprequest *req)
     req->rtp_buffersize = 0;
   }
 
-  do {
-    res = fclose(dump);
-  } while(res && ((error = errno) == EINTR));
+  res = fclose(dump);
   if(res)
     logmsg("Error closing file %s error: %d %s",
-           responsedump, error, strerror(error));
+           responsedump, errno, strerror(errno));
 
   if(got_exit_signal) {
     free(ptr);
@@ -1394,7 +1390,7 @@ server_cleanup:
 
   if(got_exit_signal) {
     logmsg("========> %s rtspd (port: %d pid: %ld) exits with signal (%d)",
-           ipv_inuse, (int)port, (long)getpid(), exit_signal);
+           ipv_inuse, (int)port, (long)Curl_getpid(), exit_signal);
     /*
      * To properly set the return status of the process we
      * must raise the same signal SIGINT or SIGTERM that we

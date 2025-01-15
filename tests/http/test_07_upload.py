@@ -669,6 +669,25 @@ class TestUpload:
         ])
         r.check_stats(count=1, http_status=200, exitcode=0)
 
+    # issue #15688 when posting a form and cr_mime_read() is called with
+    # length < 4, we did not progress
+    @pytest.mark.parametrize("proto", ['http/1.1'])
+    def test_07_62_upload_issue_15688(self, env: Env, httpd, proto):
+        # this length leads to (including multipart formatting) to a
+        # client reader invocation with length 1.
+        upload_len = 196169
+        fname = f'data-{upload_len}'
+        env.make_data_file(indir=env.gen_dir, fname=fname, fsize=upload_len)
+        fdata = os.path.join(env.gen_dir, fname)
+        curl = CurlClient(env=env)
+        url = f'https://{env.authority_for(env.domain1, proto)}/curltest/echo?id=[0-0]'
+        r = curl.http_form(urls=[url], form={
+            'file': f'@{fdata}',
+        }, alpn_proto=proto, extra_args=[
+            '--max-time', '10'
+        ])
+        r.check_stats(count=1, http_status=200, exitcode=0)
+
     # nghttpx is the only server we have that supports TLS early data and
     # has a limit of 16k it announces
     @pytest.mark.skipif(condition=not Env.have_nghttpx(), reason="no nghttpx")
@@ -678,7 +697,10 @@ class TestUpload:
         ['http/1.1', 32*1024, 16384],  # headers+body, limited by server max
         ['h2', 10*1024, 10378],        # headers+body
         ['h2', 32*1024, 16384],        # headers+body, limited by server max
-        ['h3', 1024, 0],               # earlydata not supported
+        ['h3', 1024, 1126],            # headers+body (app data)
+        ['h3', 1024 * 1024, 131177],   # headers+body (long app data). The 0RTT
+                                       # size is limited by our sendbuf size
+                                       # of 128K.
     ])
     def test_07_70_put_earlydata(self, env: Env, httpd, nghttpx, proto, upload_size, exp_early):
         if not env.curl_uses_lib('gnutls'):
@@ -708,7 +730,7 @@ class TestUpload:
         self.check_downloads(client, [f"{upload_size}"], count)
         earlydata = {}
         for line in r.trace_lines:
-            m = re.match(r'^\[t-(\d+)] EarlyData: (\d+)', line)
+            m = re.match(r'^\[t-(\d+)] EarlyData: (-?\d+)', line)
             if m:
                 earlydata[int(m.group(1))] = int(m.group(2))
         assert earlydata[0] == 0, f'{earlydata}'

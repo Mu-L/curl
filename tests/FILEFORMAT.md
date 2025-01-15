@@ -74,6 +74,13 @@ For example, to insert the word hello 100 times:
 
     %repeat[100 x hello]%
 
+## Insert capped epoch days
+
+Mostly to test capped cookie expire dates: `%days[NUM]` inserts the number of
+seconds for the given number of days into the future, aligned to the nearest
+minute. That is the same calculation the cookie engine uses to cap expiration
+dates.
+
 ## Include file
 
 This instruction allows a test case to include another file. It is helpful to
@@ -207,9 +214,6 @@ may actually consist of multiple words separated by spaces which are treated
 together as a single identifier. Most keywords are only there to provide a way
 for users to skip certain classes of tests, if desired, but a few are treated
 specially by the test harness or build system.
-
-When using curl built with Hyper, the keywords must include `HTTP` or `HTTPS`
-for 'hyper mode' to kick in and make line ending checks work for tests.
 
 When running a unit test and the keywords include `unittest`, the `<tool>`
 section can be left empty to use the standard unit test tool name `unitN` where
@@ -447,12 +451,13 @@ Features testable here are:
 - `http/2`
 - `http/3`
 - `HTTPS-proxy`
-- `hyper`
+- `HTTPSRR`
 - `IDN`
 - `IPv6`
 - `Kerberos`
 - `Largefile`
 - `large-time` (time_t is larger than 32-bit)
+- `large-size` (size_t is larger than 32-bit)
 - `ld_preload`
 - `libssh2`
 - `libssh`
@@ -522,6 +527,7 @@ the `unit/` directory (if the tool name starts with `unit`).
 Brief test case description, shown when the test runs.
 
 ### `<setenv>`
+
     variable1=contents1
     variable2=contents2
     variable3
@@ -605,6 +611,11 @@ Pass this given data on stdin to the tool.
 
 If `nonewline` is set, we cut off the trailing newline of this given data
 before comparing with the one actually received by the client
+
+## `<disable>`
+
+If `test-duphandle` is a listed item here, this is not run when
+`--test-duphandle` is used.
 
 ## `<verify>`
 ### `<errorcode>`
