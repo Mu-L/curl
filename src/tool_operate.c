@@ -87,6 +87,7 @@
 #include "tool_parsecfg.h"
 #include "tool_setopt.h"
 #include "tool_sleep.h"
+#include "tool_ssls.h"
 #include "tool_urlglob.h"
 #include "tool_util.h"
 #include "tool_writeout.h"
@@ -109,12 +110,6 @@ CURL_EXTERN CURLcode curl_easy_perform_ev(CURL *easy);
 #define CURL_DECLARED_CURL_CA_EMBED
 extern const unsigned char curl_ca_embed[];
 #endif
-#endif
-
-#ifndef O_BINARY
-/* since O_BINARY as used in bitmasks, setting it to zero makes it usable in
-   source code but yet it does not ruin anything */
-#  define O_BINARY 0
 #endif
 
 #ifndef SOL_IP
@@ -145,7 +140,6 @@ static bool is_fatal_error(CURLcode code)
   case CURLE_FAILED_INIT:
   case CURLE_OUT_OF_MEMORY:
   case CURLE_UNKNOWN_OPTION:
-  case CURLE_FUNCTION_NOT_FOUND:
   case CURLE_BAD_FUNCTION_ARGUMENT:
     /* critical error */
     return TRUE;
@@ -380,16 +374,16 @@ static CURLcode pre_transfer(struct GlobalConfig *global,
       case FAB$C_VAR:
       case FAB$C_VFC:
       case FAB$C_STMCR:
-        per->infd = open(per->uploadfile, O_RDONLY | O_BINARY);
+        per->infd = open(per->uploadfile, O_RDONLY | CURL_O_BINARY);
         break;
       default:
-        per->infd = open(per->uploadfile, O_RDONLY | O_BINARY,
+        per->infd = open(per->uploadfile, O_RDONLY | CURL_O_BINARY,
                          "rfm=stmlf", "ctx=stm");
       }
     }
     if(per->infd == -1)
 #else
-      per->infd = open(per->uploadfile, O_RDONLY | O_BINARY);
+      per->infd = open(per->uploadfile, O_RDONLY | CURL_O_BINARY);
     if((per->infd == -1) || fstat(per->infd, &fileinfo))
 #endif
     {
@@ -677,7 +671,7 @@ static CURLcode post_per_transfer(struct GlobalConfig *global,
               outs->bytes);
         fflush(outs->stream);
         /* truncate file at the position where we started appending */
-#ifdef HAVE_FTRUNCATE
+#if defined(HAVE_FTRUNCATE) && !defined(__DJGPP__) && !defined(__AMIGA__)
         if(ftruncate(fileno(outs->stream), outs->init)) {
           /* when truncate fails, we cannot just append as then we will
              create something strange, bail out */
@@ -776,50 +770,51 @@ skip:
 }
 
 /*
- * Return the protocol token for the scheme used in the given URL
+ * Possibly rewrite the URL for IPFS and return the protocol token for the
+ * scheme used in the given URL.
  */
-static CURLcode url_proto(char **url,
-                          struct OperationConfig *config,
-                          const char **scheme)
+static CURLcode url_proto_and_rewrite(char **url,
+                                      struct OperationConfig *config,
+                                      const char **scheme)
 {
   CURLcode result = CURLE_OK;
   CURLU *uh = curl_url();
   const char *proto = NULL;
   *scheme = NULL;
 
+  DEBUGASSERT(url && *url);
   if(uh) {
-    if(*url) {
-      char *schemep = NULL;
-
-      if(!curl_url_set(uh, CURLUPART_URL, *url,
-                       CURLU_GUESS_SCHEME | CURLU_NON_SUPPORT_SCHEME) &&
-         !curl_url_get(uh, CURLUPART_SCHEME, &schemep,
-                       CURLU_DEFAULT_SCHEME)) {
+    char *schemep = NULL;
+    if(!curl_url_set(uh, CURLUPART_URL, *url,
+                     CURLU_GUESS_SCHEME | CURLU_NON_SUPPORT_SCHEME) &&
+       !curl_url_get(uh, CURLUPART_SCHEME, &schemep,
+                     CURLU_DEFAULT_SCHEME)) {
 #ifdef CURL_DISABLE_IPFS
-        (void)config;
+      (void)config;
 #else
-        if(curl_strequal(schemep, proto_ipfs) ||
-           curl_strequal(schemep, proto_ipns)) {
-          result = ipfs_url_rewrite(uh, schemep, url, config);
-          /* short-circuit proto_token, we know it is ipfs or ipns */
-          if(curl_strequal(schemep, proto_ipfs))
-            proto = proto_ipfs;
-          else if(curl_strequal(schemep, proto_ipns))
-            proto = proto_ipns;
-          if(result)
-            config->synthetic_error = TRUE;
-        }
-        else
-#endif /* !CURL_DISABLE_IPFS */
-          proto = proto_token(schemep);
-
-        curl_free(schemep);
+      if(curl_strequal(schemep, proto_ipfs) ||
+         curl_strequal(schemep, proto_ipns)) {
+        result = ipfs_url_rewrite(uh, schemep, url, config);
+        /* short-circuit proto_token, we know it is ipfs or ipns */
+        if(curl_strequal(schemep, proto_ipfs))
+          proto = proto_ipfs;
+        else if(curl_strequal(schemep, proto_ipns))
+          proto = proto_ipns;
+        if(result)
+          config->synthetic_error = TRUE;
       }
+      else
+#endif /* !CURL_DISABLE_IPFS */
+        proto = proto_token(schemep);
+
+      curl_free(schemep);
     }
     curl_url_cleanup(uh);
   }
+  else
+    result = CURLE_OUT_OF_MEMORY;
 
-  *scheme = (char *) (proto ? proto : "???"); /* Never match if not found. */
+  *scheme = proto ? proto : "?"; /* Never match if not found. */
   return result;
 }
 
@@ -885,7 +880,7 @@ static CURLcode config2setopts(struct GlobalConfig *global,
                                CURLSH *share)
 {
   const char *use_proto;
-  CURLcode result = url_proto(&per->url, config, &use_proto);
+  CURLcode result = url_proto_and_rewrite(&per->url, config, &use_proto);
 
   /* Avoid having this setopt added to the --libcurl source output. */
   if(!result)
@@ -1168,6 +1163,22 @@ static CURLcode config2setopts(struct GlobalConfig *global,
     /* new in libcurl 7.56.0 */
     if(config->ssh_compression)
       my_setopt(curl, CURLOPT_SSH_COMPRESSION, 1L);
+
+    if(!config->insecure_ok) {
+      char *known = findfile(".ssh/known_hosts", FALSE);
+      if(known) {
+        /* new in curl 7.19.6 */
+        result = res_setopt_str(curl, CURLOPT_SSH_KNOWNHOSTS, known);
+        curl_free(known);
+        if(result == CURLE_UNKNOWN_OPTION)
+          /* libssh2 version older than 1.1.1 */
+          result = CURLE_OK;
+        if(result)
+          return result;
+      }
+      else
+        warnf(global, "Couldn't find a known_hosts file");
+    }
   }
 
   if(config->cacert)
@@ -1342,23 +1353,6 @@ static CURLcode config2setopts(struct GlobalConfig *global,
 
   if(config->path_as_is)
     my_setopt(curl, CURLOPT_PATH_AS_IS, 1L);
-
-  if((use_proto == proto_scp || use_proto == proto_sftp) &&
-     !config->insecure_ok) {
-    char *known = findfile(".ssh/known_hosts", FALSE);
-    if(known) {
-      /* new in curl 7.19.6 */
-      result = res_setopt_str(curl, CURLOPT_SSH_KNOWNHOSTS, known);
-      curl_free(known);
-      if(result == CURLE_UNKNOWN_OPTION)
-        /* libssh2 version older than 1.1.1 */
-        result = CURLE_OK;
-      if(result)
-        return result;
-    }
-    else
-      warnf(global, "Couldn't find a known_hosts file");
-  }
 
   if(config->no_body || config->remote_time) {
     /* no body or use remote time */
@@ -1941,12 +1935,9 @@ static CURLcode single_transfer(struct GlobalConfig *global,
 
         /* open file for reading: */
         FILE *file = fopen(config->etag_compare_file, FOPEN_READTEXT);
-        if(!file && !config->etag_save_file) {
-          errorf(global,
-                 "Failed to open %s", config->etag_compare_file);
-          result = CURLE_READ_ERROR;
-          break;
-        }
+        if(!file)
+          warnf(global, "Failed to open %s: %s", config->etag_compare_file,
+                strerror(errno));
 
         if((PARAM_OK == file2string(&etag_from_file, file)) &&
            etag_from_file) {
@@ -1978,6 +1969,12 @@ static CURLcode single_transfer(struct GlobalConfig *global,
       }
 
       if(config->etag_save_file) {
+        if(config->create_dirs) {
+          result = create_dir_hierarchy(config->etag_save_file, global);
+          if(result)
+            break;
+        }
+
         /* open file for output: */
         if(strcmp(config->etag_save_file, "-")) {
           FILE *newfile = fopen(config->etag_save_file, "ab");
@@ -1997,7 +1994,7 @@ static CURLcode single_transfer(struct GlobalConfig *global,
         }
         else {
           /* always use binary mode for protocol header output */
-          set_binmode(etag_save->stream);
+          CURL_SET_BINMODE(etag_save->stream);
         }
       }
 
@@ -2042,7 +2039,7 @@ static CURLcode single_transfer(struct GlobalConfig *global,
         if(!strcmp(config->headerfile, "%")) {
           heads->stream = stderr;
           /* use binary mode for protocol header output */
-          set_binmode(heads->stream);
+          CURL_SET_BINMODE(heads->stream);
         }
         else if(strcmp(config->headerfile, "-")) {
           FILE *newfile;
@@ -2083,7 +2080,7 @@ static CURLcode single_transfer(struct GlobalConfig *global,
         }
         else {
           /* always use binary mode for protocol header output */
-          set_binmode(heads->stream);
+          CURL_SET_BINMODE(heads->stream);
         }
       }
 
@@ -2270,7 +2267,7 @@ static CURLcode single_transfer(struct GlobalConfig *global,
         DEBUGASSERT(per->infdopen == FALSE);
         DEBUGASSERT(per->infd == STDIN_FILENO);
 
-        set_binmode(stdin);
+        CURL_SET_BINMODE(stdin);
         if(!strcmp(per->uploadfile, ".")) {
           if(curlx_nonblock((curl_socket_t)per->infd, TRUE) < 0)
             warnf(global,
@@ -2304,7 +2301,7 @@ static CURLcode single_transfer(struct GlobalConfig *global,
          !config->use_ascii) {
         /* We get the output to stdout and we have not got the ASCII/text
            flag, then set stdout to be binary */
-        set_binmode(stdout);
+        CURL_SET_BINMODE(stdout);
       }
 
       /* explicitly passed to stdout means okaying binary gunk */
@@ -2456,7 +2453,7 @@ static CURLcode add_parallel_transfers(struct GlobalConfig *global,
     all_added++;
     *addedp = TRUE;
   }
-  *morep = (per || sleeping) ? TRUE : FALSE;
+  *morep = (per || sleeping);
   return CURLE_OK;
 }
 
@@ -2885,6 +2882,17 @@ static CURLcode serial_transfers(struct GlobalConfig *global,
       if(getenv("CURL_FORBID_REUSE"))
         (void)curl_easy_setopt(per->curl, CURLOPT_FORBID_REUSE, 1L);
 
+      if(global->test_duphandle) {
+        CURL *dup = curl_easy_duphandle(per->curl);
+        curl_easy_cleanup(per->curl);
+        per->curl = dup;
+        if(!dup) {
+          result = CURLE_OUT_OF_MEMORY;
+          break;
+        }
+        /* a duplicate needs the share re-added */
+        (void)curl_easy_setopt(per->curl, CURLOPT_SHARE, share);
+      }
       if(global->test_event_based)
         result = curl_easy_perform_ev(per->curl);
       else
@@ -3176,8 +3184,13 @@ CURLcode operate(struct GlobalConfig *global, int argc, argv_item_t argv[])
       if(res == PARAM_HELP_REQUESTED)
         tool_help(global->help_category);
       /* Check if we were asked for the manual */
-      else if(res == PARAM_MANUAL_REQUESTED)
+      else if(res == PARAM_MANUAL_REQUESTED) {
+#ifdef USE_MANUAL
         hugehelp();
+#else
+        puts("built-in manual was disabled at build-time");
+#endif
+      }
       /* Check if we were asked for the version information */
       else if(res == PARAM_VERSION_INFO_REQUESTED)
         tool_version_info();
@@ -3225,18 +3238,31 @@ CURLcode operate(struct GlobalConfig *global, int argc, argv_item_t argv[])
           curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_PSL);
           curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_HSTS);
 
-          /* Get the required arguments for each operation */
-          do {
-            result = get_args(operation, count++);
+          if(global->ssl_sessions && feature_ssls_export)
+            result = tool_ssls_load(global, global->first, share,
+                                    global->ssl_sessions);
 
-            operation = operation->next;
-          } while(!result && operation);
+          if(!result) {
+            /* Get the required arguments for each operation */
+            do {
+              result = get_args(operation, count++);
 
-          /* Set the current operation pointer */
-          global->current = global->first;
+              operation = operation->next;
+            } while(!result && operation);
 
-          /* now run! */
-          result = run_all_transfers(global, share, result);
+            /* Set the current operation pointer */
+            global->current = global->first;
+
+            /* now run! */
+            result = run_all_transfers(global, share, result);
+
+            if(global->ssl_sessions && feature_ssls_export) {
+              CURLcode r2 = tool_ssls_save(global, global->first, share,
+                                           global->ssl_sessions);
+              if(r2 && !result)
+                result = r2;
+            }
+          }
 
           curl_share_cleanup(share);
           if(global->libcurl) {

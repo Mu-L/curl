@@ -38,6 +38,11 @@
 #include <unistd.h>
 #endif
 
+#ifdef _WIN32
+#undef stat
+#define stat _stat
+#endif
+
 /* curl stuff */
 #include <curl/curl.h>
 #include <curl/mprintf.h>
@@ -53,6 +58,7 @@
 
 #ifdef _MSC_VER
 #define gettimeofday(a, b) my_gettimeofday((a), (b))
+static
 int my_gettimeofday(struct timeval *tp, void *tzp)
 {
   (void)tzp;

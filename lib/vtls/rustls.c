@@ -37,6 +37,7 @@
 #include "sendf.h"
 #include "vtls.h"
 #include "vtls_int.h"
+#include "rustls.h"
 #include "select.h"
 #include "strerror.h"
 #include "multiif.h"
@@ -570,7 +571,7 @@ cr_init_backend(struct Curl_cfilter *cf, struct Curl_easy *data,
       break;
     default:
       failf(data, "rustls: unsupported minimum TLS version value");
-      return CURLE_SSL_ENGINE_INITFAILED;
+      return CURLE_BAD_FUNCTION_ARGUMENT;
     }
 
     switch(conn_config->version_max) {
@@ -588,7 +589,7 @@ cr_init_backend(struct Curl_cfilter *cf, struct Curl_easy *data,
     case CURL_SSLVERSION_MAX_TLSv1_0:
     default:
       failf(data, "rustls: unsupported maximum TLS version value");
-      return CURLE_SSL_ENGINE_INITFAILED;
+      return CURLE_BAD_FUNCTION_ARGUMENT;
     }
 
     cipher_suites = malloc(sizeof(cipher_suites) * (cipher_suites_len));
@@ -610,7 +611,7 @@ cr_init_backend(struct Curl_cfilter *cf, struct Curl_easy *data,
     if(result != RUSTLS_RESULT_OK) {
       failf(data,
             "rustls: failed to create crypto provider builder from default");
-      return CURLE_SSL_ENGINE_INITFAILED;
+      return CURLE_SSL_CIPHER;
     }
 
     result =
@@ -622,7 +623,7 @@ cr_init_backend(struct Curl_cfilter *cf, struct Curl_easy *data,
       failf(data,
             "rustls: failed to set ciphersuites for crypto provider builder");
       rustls_crypto_provider_builder_free(custom_provider_builder);
-      return CURLE_SSL_ENGINE_INITFAILED;
+      return CURLE_SSL_CIPHER;
     }
 
     result = rustls_crypto_provider_builder_build(
@@ -630,7 +631,7 @@ cr_init_backend(struct Curl_cfilter *cf, struct Curl_easy *data,
     if(result != RUSTLS_RESULT_OK) {
       failf(data, "rustls: failed to build custom crypto provider");
       rustls_crypto_provider_builder_free(custom_provider_builder);
-      return CURLE_SSL_ENGINE_INITFAILED;
+      return CURLE_SSL_CIPHER;
     }
 
     result = rustls_client_config_builder_new_custom(custom_provider,
@@ -640,7 +641,7 @@ cr_init_backend(struct Curl_cfilter *cf, struct Curl_easy *data,
     free(cipher_suites);
     if(result != RUSTLS_RESULT_OK) {
       failf(data, "rustls: failed to create client config");
-      return CURLE_SSL_ENGINE_INITFAILED;
+      return CURLE_SSL_CIPHER;
     }
   }
 
@@ -747,7 +748,7 @@ cr_init_backend(struct Curl_cfilter *cf, struct Curl_easy *data,
   if(result != RUSTLS_RESULT_OK) {
     failf(data, "rustls: failed to build client config");
     rustls_client_config_free(backend->config);
-    return CURLE_SSL_ENGINE_INITFAILED;
+    return CURLE_SSL_CONNECT_ERROR;
   }
 
   DEBUGASSERT(rconn == NULL);
@@ -1075,27 +1076,24 @@ const struct Curl_ssl Curl_ssl_rustls = {
   SSLSUPP_TLS13_CIPHERSUITES,
   sizeof(struct rustls_ssl_backend_data),
 
-  Curl_none_init,                  /* init */
-  Curl_none_cleanup,               /* cleanup */
+  NULL,                            /* init */
+  NULL,                            /* cleanup */
   cr_version,                      /* version */
-  Curl_none_check_cxn,             /* check_cxn */
   cr_shutdown,                     /* shutdown */
   cr_data_pending,                 /* data_pending */
   cr_random,                       /* random */
-  Curl_none_cert_status_request,   /* cert_status_request */
+  NULL,                            /* cert_status_request */
   cr_connect_blocking,             /* connect */
   cr_connect_nonblocking,          /* connect_nonblocking */
   Curl_ssl_adjust_pollset,         /* adjust_pollset */
   cr_get_internals,                /* get_internals */
   cr_close,                        /* close_one */
-  Curl_none_close_all,             /* close_all */
-  Curl_none_set_engine,            /* set_engine */
-  Curl_none_set_engine_default,    /* set_engine_default */
-  Curl_none_engines_list,          /* engines_list */
-  Curl_none_false_start,           /* false_start */
+  NULL,                            /* close_all */
+  NULL,                            /* set_engine */
+  NULL,                            /* set_engine_default */
+  NULL,                            /* engines_list */
+  NULL,                            /* false_start */
   NULL,                            /* sha256sum */
-  NULL,                            /* associate_connection */
-  NULL,                            /* disassociate_connection */
   cr_recv,                         /* recv decrypted data */
   cr_send,                         /* send data to encrypt */
   NULL,                            /* get_channel_binding */

@@ -644,13 +644,7 @@ static CURLcode setopt_long(struct Curl_easy *data, CURLoption option,
     break;
 
   case CURLOPT_HTTP09_ALLOWED:
-#ifdef USE_HYPER
-    /* Hyper does not support HTTP/0.9 */
-    if(enabled)
-      return CURLE_BAD_FUNCTION_ARGUMENT;
-#else
     data->set.http09_allowed = enabled;
-#endif
     break;
 #endif /* ! CURL_DISABLE_HTTP */
 
@@ -923,6 +917,7 @@ static CURLcode setopt_long(struct Curl_easy *data, CURLoption option,
     break;
 #endif
 
+#ifdef HAVE_GSSAPI
   case CURLOPT_GSSAPI_DELEGATION:
     /*
      * GSS-API credential delegation bitmask
@@ -930,6 +925,7 @@ static CURLcode setopt_long(struct Curl_easy *data, CURLoption option,
     data->set.gssapi_delegation = (unsigned char)uarg&
       (CURLGSSAPI_DELEGATION_POLICY_FLAG|CURLGSSAPI_DELEGATION_FLAG);
     break;
+#endif
   case CURLOPT_SSL_VERIFYPEER:
     /*
      * Enable peer SSL verifying.
@@ -991,7 +987,7 @@ static CURLcode setopt_long(struct Curl_easy *data, CURLoption option,
     /*
      * Enable TLS false start.
      */
-    if(!Curl_ssl_false_start(data))
+    if(!Curl_ssl_false_start())
       return CURLE_NOT_BUILT_IN;
 
     data->set.ssl.falsestart = enabled;
@@ -1110,7 +1106,8 @@ static CURLcode setopt_long(struct Curl_easy *data, CURLoption option,
      */
     if(arg > 2)
       return CURLE_BAD_FUNCTION_ARGUMENT;
-    data->set.connect_only = (unsigned char)arg;
+    data->set.connect_only = !!arg;
+    data->set.connect_only_ws = (arg == 2);
     break;
 
   case CURLOPT_SSL_SESSIONID_CACHE:
@@ -1146,7 +1143,7 @@ static CURLcode setopt_long(struct Curl_easy *data, CURLoption option,
     /*
      * raw data passed to the application when content encoding is used
      */
-    data->set.http_ce_skip = enabled;
+    data->set.http_ce_skip = !enabled; /* reversed */
     break;
 
 #if !defined(CURL_DISABLE_FTP) || defined(USE_SSH)
@@ -1261,7 +1258,7 @@ static CURLcode setopt_long(struct Curl_easy *data, CURLoption option,
       rtspreq = RTSPREQ_RECEIVE;
       break;
     default:
-      rtspreq = RTSPREQ_NONE;
+      return CURLE_BAD_FUNCTION_ARGUMENT;
     }
 
     data->set.rtspreq = rtspreq;
@@ -1588,8 +1585,8 @@ static CURLcode setopt_pointers(struct Curl_easy *data, CURLoption option,
         data->hsts = NULL;
 #endif
 #ifdef USE_SSL
-      if(data->share->sslsession == data->state.session)
-        data->state.session = NULL;
+      if(data->share->ssl_scache == data->state.ssl_scache)
+        data->state.ssl_scache = data->multi ? data->multi->ssl_scache : NULL;
 #endif
 #ifdef USE_LIBPSL
       if(data->psl == &data->share->psl)
@@ -1632,10 +1629,8 @@ static CURLcode setopt_pointers(struct Curl_easy *data, CURLoption option,
       }
 #endif
 #ifdef USE_SSL
-      if(data->share->sslsession) {
-        data->set.general_ssl.max_ssl_sessions = data->share->max_ssl_sessions;
-        data->state.session = data->share->sslsession;
-      }
+      if(data->share->ssl_scache)
+        data->state.ssl_scache = data->share->ssl_scache;
 #endif
 #ifdef USE_LIBPSL
       if(data->share->specifier & (1 << CURL_LOCK_DATA_PSL))
@@ -1730,14 +1725,15 @@ static CURLcode setopt_cptr(struct Curl_easy *data, CURLoption option,
     if(!ptr || data->set.postfieldsize == -1)
       result = Curl_setstropt(&data->set.str[STRING_COPYPOSTFIELDS], ptr);
     else {
+      if(data->set.postfieldsize < 0)
+        return CURLE_BAD_FUNCTION_ARGUMENT;
+#if SIZEOF_CURL_OFF_T > SIZEOF_SIZE_T
       /*
        *  Check that requested length does not overflow the size_t type.
        */
-
-      if((data->set.postfieldsize < 0) ||
-         ((sizeof(curl_off_t) != sizeof(size_t)) &&
-          (data->set.postfieldsize > (curl_off_t)((size_t)-1))))
+      else if(data->set.postfieldsize > SIZE_T_MAX)
         return CURLE_OUT_OF_MEMORY;
+#endif
       else {
         /* Allocate even when size == 0. This satisfies the need of possible
            later address compare to detect the COPYPOSTFIELDS mode, and to
@@ -1767,6 +1763,7 @@ static CURLcode setopt_cptr(struct Curl_easy *data, CURLoption option,
     Curl_safefree(data->set.str[STRING_COPYPOSTFIELDS]);
     data->set.method = HTTPREQ_POST;
     break;
+#endif /* ! CURL_DISABLE_HTTP || ! CURL_DISABLE_MQTT */
 
 #ifndef CURL_DISABLE_HTTP
   case CURLOPT_ACCEPT_ENCODING:
@@ -2109,7 +2106,6 @@ static CURLcode setopt_cptr(struct Curl_easy *data, CURLoption option,
      * The URL to fetch.
      */
     if(data->state.url_alloc) {
-      /* the already set URL is allocated, free it first! */
       Curl_safefree(data->state.url);
       data->state.url_alloc = FALSE;
     }
@@ -2185,7 +2181,7 @@ static CURLcode setopt_cptr(struct Curl_easy *data, CURLoption option,
      * proxy exception list
      */
     return Curl_setstropt(&data->set.str[STRING_NOPROXY], ptr);
-#endif
+#endif /* ! CURL_DISABLE_PROXY */
 
   case CURLOPT_RANGE:
     /*
@@ -2193,11 +2189,17 @@ static CURLcode setopt_cptr(struct Curl_easy *data, CURLoption option,
      */
     return Curl_setstropt(&data->set.str[STRING_SET_RANGE], ptr);
 
-#endif /* ! CURL_DISABLE_PROXY */
   case CURLOPT_CURLU:
     /*
      * pass CURLU to set URL
      */
+    if(data->state.url_alloc) {
+      Curl_safefree(data->state.url);
+      data->state.url_alloc = FALSE;
+    }
+    else
+      data->state.url = NULL;
+    Curl_safefree(data->set.str[STRING_SET_URL]);
     data->set.uh = (CURLU *)ptr;
     break;
   case CURLOPT_SSLCERT:

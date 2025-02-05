@@ -135,6 +135,7 @@ const struct Curl_handler Curl_handler_smtp = {
   ZERO_NULL,                        /* write_resp_hd */
   ZERO_NULL,                        /* connection_check */
   ZERO_NULL,                        /* attach connection */
+  ZERO_NULL,                        /* follow */
   PORT_SMTP,                        /* defport */
   CURLPROTO_SMTP,                   /* protocol */
   CURLPROTO_SMTP,                   /* family */
@@ -165,6 +166,7 @@ const struct Curl_handler Curl_handler_smtps = {
   ZERO_NULL,                        /* write_resp_hd */
   ZERO_NULL,                        /* connection_check */
   ZERO_NULL,                        /* attach connection */
+  ZERO_NULL,                        /* follow */
   PORT_SMTPS,                       /* defport */
   CURLPROTO_SMTPS,                  /* protocol */
   CURLPROTO_SMTP,                   /* family */
@@ -1100,12 +1102,11 @@ static CURLcode smtp_state_rcpt_resp(struct Curl_easy *data,
 
   (void)instate; /* no use for this yet */
 
-  is_smtp_err = (smtpcode/100 != 2) ? TRUE : FALSE;
+  is_smtp_err = (smtpcode/100 != 2);
 
   /* If there is multiple RCPT TO to be issued, it is possible to ignore errors
      and proceed with only the valid addresses. */
-  is_smtp_blocking_err =
-    (is_smtp_err && !data->set.mail_rcpt_allowfails) ? TRUE : FALSE;
+  is_smtp_blocking_err = (is_smtp_err && !data->set.mail_rcpt_allowfails);
 
   if(is_smtp_err) {
     /* Remembering the last failure which we can report if all "RCPT TO" have
@@ -1287,7 +1288,7 @@ static CURLcode smtp_multi_statemach(struct Curl_easy *data, bool *done)
   struct connectdata *conn = data->conn;
   struct smtp_conn *smtpc = &conn->proto.smtpc;
 
-  if((conn->handler->flags & PROTOPT_SSL) && !smtpc->ssldone) {
+  if(Curl_conn_is_ssl(conn, FIRSTSOCKET) && !smtpc->ssldone) {
     bool ssldone = FALSE;
     result = Curl_conn_connect(data, FIRSTSOCKET, FALSE, &ssldone);
     smtpc->ssldone = ssldone;
@@ -1296,7 +1297,7 @@ static CURLcode smtp_multi_statemach(struct Curl_easy *data, bool *done)
   }
 
   result = Curl_pp_statemach(data, &smtpc->pp, FALSE, FALSE);
-  *done = (smtpc->state == SMTP_STOP) ? TRUE : FALSE;
+  *done = (smtpc->state == SMTP_STOP);
 
   return result;
 }

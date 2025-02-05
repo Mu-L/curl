@@ -34,6 +34,7 @@
 # - `WOLFSSL_INCLUDE_DIRS`:  The wolfSSL include directories.
 # - `WOLFSSL_LIBRARIES`:     The wolfSSL library names.
 # - `WOLFSSL_LIBRARY_DIRS`:  The wolfSSL library directories.
+# - `WOLFSSL_PC_REQUIRES`:   The wolfSSL pkg-config packages.
 # - `WOLFSSL_CFLAGS`:        Required compiler flags.
 # - `WOLFSSL_VERSION`:       Version of wolfSSL.
 
@@ -46,11 +47,13 @@ if(DEFINED WolfSSL_LIBRARY AND NOT DEFINED WOLFSSL_LIBRARY)
   set(WOLFSSL_LIBRARY "${WolfSSL_LIBRARY}")
 endif()
 
+set(WOLFSSL_PC_REQUIRES "wolfssl")
+
 if(CURL_USE_PKGCONFIG AND
    NOT DEFINED WOLFSSL_INCLUDE_DIR AND
    NOT DEFINED WOLFSSL_LIBRARY)
   find_package(PkgConfig QUIET)
-  pkg_check_modules(WOLFSSL "wolfssl")
+  pkg_check_modules(WOLFSSL ${WOLFSSL_PC_REQUIRES})
 endif()
 
 if(WOLFSSL_FOUND)
@@ -60,6 +63,7 @@ else()
   find_path(WOLFSSL_INCLUDE_DIR NAMES "wolfssl/ssl.h")
   find_library(WOLFSSL_LIBRARY NAMES "wolfssl")
 
+  unset(WOLFSSL_VERSION CACHE)
   if(WOLFSSL_INCLUDE_DIR AND EXISTS "${WOLFSSL_INCLUDE_DIR}/wolfssl/version.h")
     set(_version_regex "#[\t ]*define[\t ]+LIBWOLFSSL_VERSION_STRING[\t ]+\"([^\"]*)\"")
     file(STRINGS "${WOLFSSL_INCLUDE_DIR}/wolfssl/version.h" _version_str REGEX "${_version_regex}")
@@ -86,10 +90,10 @@ else()
   mark_as_advanced(WOLFSSL_INCLUDE_DIR WOLFSSL_LIBRARY)
 endif()
 
-if(NOT WIN32)
-  find_library(_math_library "m")
-  if(_math_library)
-    list(APPEND WOLFSSL_LIBRARIES "m")  # for log and pow
+if(WOLFSSL_FOUND AND NOT WIN32)
+  find_library(MATH_LIBRARY NAMES "m")
+  if(MATH_LIBRARY)
+    list(APPEND WOLFSSL_LIBRARIES ${MATH_LIBRARY})  # for log and pow
   endif()
-  mark_as_advanced(_math_library)
+  mark_as_advanced(MATH_LIBRARY)
 endif()

@@ -250,6 +250,7 @@ const struct Curl_handler Curl_handler_ftp = {
   ZERO_NULL,                       /* write_resp_hd */
   ZERO_NULL,                       /* connection_check */
   ZERO_NULL,                       /* attach connection */
+  ZERO_NULL,                       /* follow */
   PORT_FTP,                        /* defport */
   CURLPROTO_FTP,                   /* protocol */
   CURLPROTO_FTP,                   /* family */
@@ -282,6 +283,7 @@ const struct Curl_handler Curl_handler_ftps = {
   ZERO_NULL,                       /* write_resp_hd */
   ZERO_NULL,                       /* connection_check */
   ZERO_NULL,                       /* attach connection */
+  ZERO_NULL,                       /* follow */
   PORT_FTPS,                       /* defport */
   CURLPROTO_FTPS,                  /* protocol */
   CURLPROTO_FTP,                   /* family */
@@ -2042,10 +2044,10 @@ static CURLcode client_write_header(struct Curl_easy *data,
    * headers from CONNECT should not automatically be part of the
    * output. */
   CURLcode result;
-  int save = data->set.include_header;
+  bool save = data->set.include_header;
   data->set.include_header = TRUE;
   result = Curl_client_write(data, CLIENTWRITE_HEADER, buf, blen);
-  data->set.include_header = save ? TRUE : FALSE;
+  data->set.include_header = save;
   return result;
 }
 
@@ -2079,10 +2081,19 @@ static CURLcode ftp_state_mdtm_resp(struct Curl_easy *data,
       /* If we asked for a time of the file and we actually got one as well,
          we "emulate" an HTTP-style header in our output. */
 
+#if defined(__GNUC__) && (defined(__DJGPP__) || defined(__AMIGA__))
+#pragma GCC diagnostic push
+/* 'time_t' is unsigned in MSDOS and AmigaOS. Silence:
+   warning: comparison of unsigned expression in '>= 0' is always true */
+#pragma GCC diagnostic ignored "-Wtype-limits"
+#endif
       if(data->req.no_body &&
          ftpc->file &&
          data->set.get_filetime &&
          (data->info.filetime >= 0) ) {
+#if defined(__GNUC__) && (defined(__DJGPP__) || defined(__AMIGA__))
+#pragma GCC diagnostic pop
+#endif
         char headerbuf[128];
         int headerbuflen;
         time_t filetime = data->info.filetime;
@@ -2793,7 +2804,7 @@ static CURLcode ftp_statemachine(struct Curl_easy *data,
       if(ftpcode/100 == 2)
         /* We have enabled SSL for the data connection! */
         conn->bits.ftp_use_data_ssl =
-          (data->set.use_ssl != CURLUSESSL_CONTROL) ? TRUE : FALSE;
+          (data->set.use_ssl != CURLUSESSL_CONTROL);
       /* FTP servers typically responds with 500 if they decide to reject
          our 'P' request */
       else if(data->set.use_ssl > CURLUSESSL_CONTROL)
@@ -3110,7 +3121,7 @@ static CURLcode ftp_multi_statemach(struct Curl_easy *data,
   /* Check for the state outside of the Curl_socket_check() return code checks
      since at times we are in fact already in this state when this function
      gets called. */
-  *done = (ftpc->state == FTP_STOP) ? TRUE : FALSE;
+  *done = (ftpc->state == FTP_STOP);
 
   return result;
 }
@@ -3154,7 +3165,7 @@ static CURLcode ftp_connect(struct Curl_easy *data,
 
   PINGPONG_SETUP(pp, ftp_statemachine, ftp_endofresp);
 
-  if(conn->handler->flags & PROTOPT_SSL) {
+  if(Curl_conn_is_ssl(conn, FIRSTSOCKET)) {
     /* BLOCKING */
     result = Curl_conn_connect(data, FIRSTSOCKET, TRUE, done);
     if(result)
@@ -4097,8 +4108,8 @@ static CURLcode ftp_disconnect(struct Curl_easy *data,
 }
 
 #ifdef _MSC_VER
-/* warning C4706: assignment within conditional expression */
-#pragma warning(disable:4706)
+#pragma warning(push)
+#pragma warning(disable:4706) /* assignment within conditional expression */
 #endif
 
 /***********************************************************************
@@ -4244,7 +4255,7 @@ CURLcode ftp_parse_url_path(struct Curl_easy *data)
       else
         n -= ftpc->file ? strlen(ftpc->file) : 0;
 
-      if((strlen(oldPath) == n) && !strncmp(rawPath, oldPath, n)) {
+      if((strlen(oldPath) == n) && rawPath && !strncmp(rawPath, oldPath, n)) {
         infof(data, "Request has same path as previous transfer");
         ftpc->cwddone = TRUE;
       }
@@ -4254,6 +4265,10 @@ CURLcode ftp_parse_url_path(struct Curl_easy *data)
   free(rawPath);
   return CURLE_OK;
 }
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 /* call this when the DO phase has completed */
 static CURLcode ftp_dophase_done(struct Curl_easy *data, bool connected)
